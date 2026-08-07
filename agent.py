@@ -163,7 +163,7 @@ def agent_loop(messages: list, max_rounds: int = 10):
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         outputs = model.generate(
             **inputs,
-            max_new_tokens=512,   # 工具调用 JSON 比普通回答长,比原 256 放宽
+            max_new_tokens=2048,
             do_sample=False,
         )
         new_ids = outputs[0][inputs["input_ids"].shape[1]:]
