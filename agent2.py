@@ -2,20 +2,21 @@ import json
 import os
 import re
 import subprocess
+import sys
 import torch
 from pathlib import Path
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 base_model_name = "Qwen/Qwen3.5-9B"
-adapter_path = "./output/trigger_bash/final"
+adapter_path = "./output/trigger_bash_v2/final"
 
 model = AutoModelForCausalLM.from_pretrained(
     base_model_name,
-    torch_dtype=torch.bfloat16,   # 修复:dtype → torch_dtype
+    dtype=torch.bfloat16,
     local_files_only=True,
     device_map="auto",
     trust_remote_code=True,
@@ -91,7 +92,7 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-# ---------- 工具定义(OpenAI 格式,保留备用;本版手工拼 prompt,不自动渲染) ----------
+# ---------- 工具定义(OpenAI 格式;传给 apply_chat_template,渲染方式与训练完全一致) ----------
 TOOLS = [
     {"type": "function", "function": {
         "name": "bash", "description": "Run a shell command.",
@@ -132,7 +133,7 @@ TOOL_HANDLERS = {
     "glob": run_glob,
 }
 
-# ---------- 解析工具调用(<tool_call> XML 风格,与 LoRA 训练格式一致) ----------
+# ---------- 解析工具调用(<tool_call> XML 风格,与 Qwen3 模板渲染一致) ----------
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
 FUNC_RE = re.compile(r"<function=([^>]+)>", re.S)
 PARAM_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.S)
@@ -149,51 +150,49 @@ def parse_tool_calls(text: str) -> list[dict]:
         calls.append({"name": name, "arguments": json.dumps(args, ensure_ascii=False)})
     return calls
 
-def render_tool_result(name: str, output: str) -> str:
-    """把工具结果拼回对话流。训练数据的格式在这里定,不对就只改这一个函数。"""
-    # 变体 A(默认,o4 风格:结果紧跟调用之后,assistant 回合不结束)
-    return (f"<tool_call_result>\n<function={name}>\n"
-            f"<parameter=result>\n{output}\n</parameter>\n"
-            f"</function>\n</tool_call_result>\n")
-    # 变体 B(若训练数据里每次 assistant 输出都以 <|im_end|> 收尾,结果单独成段):
-    # return (f"<|im_end|>\n<tool_call_result>\n<function={name}>\n"
-    #         f"<parameter=result>\n{output}\n</parameter>\n"
-    #         f"</function>\n</tool_call_result>\n<|im_start|>assistant\n")
-
-def build_prompt(segments: list[str]) -> str:
-    return "".join(segments) + "<|im_start|>assistant\n"
-
 def strip_thinking(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     return text.replace("<think>", "").replace("</think>", "")
 
-# ---------- agent loop(手工拼 prompt,不再用 apply_chat_template) ----------
-def agent_loop(segments: list[str], max_rounds: int = 10):
+# ---------- agent loop(消息用 OpenAI 格式存,每轮用 apply_chat_template + tools 渲染) ----------
+# 关键点:训练时 TRL 会把 example["tools"] 传给 chat template,渲染出 "# Tools" 工具说明段;
+# 推理这里也必须用同样的方式渲染,否则模型不知道有工具可用,就不会输出 <tool_call>。
+def agent_loop(messages: list[dict], max_rounds: int = 10):
     for _ in range(max_rounds):
-        prompt = build_prompt(segments)
+        prompt = tokenizer.apply_chat_template(
+            messages, tools=TOOLS, add_generation_prompt=True, tokenize=False)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         outputs = model.generate(
             **inputs,
             max_new_tokens=2048,
             do_sample=False,
+            repetition_penalty=1.05,   # 防止退化成重复文本死循环
         )
         new_ids = outputs[0][inputs["input_ids"].shape[1]:]
         raw = tokenizer.decode(new_ids, skip_special_tokens=False)
 
-        assistant_text = raw.split("<|im_end|>")[0]   # 只保留本回合生成段
+        assistant_text = re.split(r"<\|im_end\|>|<\|endoftext\|>", raw)[0]
 
         tool_calls = parse_tool_calls(assistant_text)
         if not tool_calls:
-            final_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-            print(strip_thinking(final_text))
-            # 回填最终回答,保持多轮上下文
-            segments.append("<|im_start|>assistant\n" + assistant_text.strip() + "\n<|im_end|>\n")
+            final_text = strip_thinking(
+                tokenizer.decode(new_ids, skip_special_tokens=True).strip())
+            print(final_text)
+            messages.append({"role": "assistant", "content": final_text})
             return
 
         # 截到最后一个 </tool_call>,丢弃后面的杂音
         end = assistant_text.rfind("</tool_call>") + len("</tool_call>")
         call_part = assistant_text[:end]
-        segments.append("<|im_start|>assistant\n" + call_part)   # 故意不加 <|im_end|>(变体 A)
+
+        # 按 OpenAI 格式回填 assistant 回合(模板会渲染回 <tool_call> XML,与训练一致)
+        # 注意 arguments 必须是 dict,模板用 |items 遍历;传 JSON 字符串会报错
+        calls = [
+            {"type": "function", "function": {
+                "name": c["name"], "arguments": json.loads(c["arguments"])}}
+            for c in tool_calls
+        ]
+        messages.append({"role": "assistant", "content": "", "tool_calls": calls})
 
         for call in tool_calls:
             name = call["name"]
@@ -205,15 +204,49 @@ def agent_loop(segments: list[str], max_rounds: int = 10):
             except Exception as e:
                 output = f"Error: {e}"
             print(str(output)[:200])
-            segments.append(render_tool_result(name, str(output)))
+            # 工具结果按 {"role": "tool"} 回填,模板渲染成 <tool_response>,与训练一致
+            messages.append({"role": "tool", "content": str(output)})
 
     print("(reached max rounds)")
 
 # ---------- 交互入口 ----------
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Qwen3.5-9B + LoRA tool-use agent")
+    parser.add_argument("queries", nargs="*", help="非交互模式:直接传入问题")
+    parser.add_argument("--no-lora", action="store_true",
+                        help="不加载 LoRA adapter,用基座模型(其原生工具调用能力更强)")
+    cli = parser.parse_args()
+
     print("Qwen3.5-9B + LoRA Tool Use(<tool_call> 格式)")
     print("输入问题,回车发送。输入 q 退出。\n")
-    segments = [f"<|im_start|>system\n{SYSTEM}<|im_end|>\n"]   # 跨轮保留
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        dtype=torch.bfloat16,
+        local_files_only=True,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    if not cli.no_lora:
+        model = PeftModel.from_pretrained(model, adapter_path)
+        print(f"(已加载 LoRA: {adapter_path})")
+    else:
+        print("(--no-lora: 未加载 LoRA,使用基座模型)")
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    messages = [{"role": "system", "content": SYSTEM}]   # 跨轮保留
+    if cli.queries:
+        # 非交互模式:处理命令行传入的问题后退出(便于测试)
+        for query in cli.queries:
+            print(f"\033[36magent >> \033[0m{query}")
+            messages.append({"role": "user", "content": query})
+            agent_loop(messages)
+            print()
+        raise SystemExit(0)
     while True:
         try:
             query = input("\033[36magent >> \033[0m")
@@ -221,6 +254,6 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        segments.append(f"<|im_start|>user\n{query}<|im_end|>\n")
-        agent_loop(segments)
+        messages.append({"role": "user", "content": query})
+        agent_loop(messages)
         print()
